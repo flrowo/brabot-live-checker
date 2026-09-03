@@ -4,15 +4,19 @@ import {
   EmbedBuilder,
   TextChannel,
   Events,
+  Message,
 } from 'discord.js';
 import dotenv from 'dotenv';
+import fs from 'fs/promises';
+import path from 'path';
 
 dotenv.config();
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID || '532676295939850250';
+const DATA_FILE = path.join(__dirname, 'data.json');
 
-const STREAMS = [
+const DEFAULT_STREAMS = [
   { username: "Bruno", bearerToken: "FSIauhwiuasdhiufhiusah913274y1273" },
   { username: "Jão", bearerToken: "eae" },
   { username: "Andre", bearerToken: "asdasdasdasdasdasdasdasdas" },
@@ -23,16 +27,13 @@ const STREAMS = [
   { username: "Thiago", bearerToken: "billibilli" },
 ];
 
-const POLL_INTERVAL_MS = 15_000;
+let STREAMS: Array<{ username: string; bearerToken: string }> = [];
+
+const POLL_INTERVAL_MS = 60_000;
 const BASE_URL = 'https://b.siobud.com';
 
 if (!TOKEN) {
   console.error('❌ Error: DISCORD_TOKEN is missing in .env');
-  process.exit(1);
-}
-
-if (STREAMS.length === 0) {
-  console.error('❌ Error: No streams configured in STREAMS array.');
   process.exit(1);
 }
 
@@ -71,26 +72,61 @@ const PROBE_SDP = [
 
 interface StreamState {
   isLive: boolean;
-  messageId: string | null;
   consecutiveMisses: number;
 }
 
-const streamTracker = new Map<string, StreamState>();
-
-for (const stream of STREAMS) {
-  streamTracker.set(stream.bearerToken, {
-    isLive: false,
-    messageId: null,
-    consecutiveMisses: 0,
-  });
+interface StorageData {
+  messageId: string | null;
+  streams: Array<{ username: string; bearerToken: string }>;
 }
 
+const streamTracker = new Map<string, StreamState>();
+let dashboardMessage: Message | null = null;
+
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+  ],
 });
 
 /**
- * Checks if a stream is live by checking the SSE status event
+ * Storage helpers
+ */
+async function loadData(): Promise<StorageData> {
+  try {
+    const raw = await fs.readFile(DATA_FILE, 'utf-8');
+    return JSON.parse(raw);
+  } catch {
+    const initialData: StorageData = {
+      messageId: null,
+      streams: DEFAULT_STREAMS,
+    };
+    await saveData(initialData);
+    return initialData;
+  }
+}
+
+async function saveData(data: StorageData): Promise<void> {
+  try {
+    await fs.writeFile(DATA_FILE, JSON.stringify(data, null, 2), 'utf-8');
+  } catch (err) {
+    console.error('Failed to save data.json:', err);
+  }
+}
+
+function initStreamState(token: string) {
+  if (!streamTracker.has(token)) {
+    streamTracker.set(token, {
+      isLive: false,
+      consecutiveMisses: 0,
+    });
+  }
+}
+
+/**
+ * Checks if a stream is live via SSE
  */
 async function checkStreamStatus(streamKey: string): Promise<boolean> {
   let location: string | null = null;
@@ -113,7 +149,6 @@ async function checkStreamStatus(streamKey: string): Promise<boolean> {
     location = res.headers.get('Location');
     if (!location) return false;
 
-    // Connect to the SSE endpoint to get the real-time status JSON
     const sseUrl = `${BASE_URL}${location.replace('/api/whep/', '/api/sse/')}`;
     const sseRes = await fetch(sseUrl, {
       signal: AbortSignal.timeout(3000),
@@ -125,13 +160,11 @@ async function checkStreamStatus(streamKey: string): Promise<boolean> {
 
     const reader = sseRes.body.getReader();
     const { value } = await reader.read();
-    reader.cancel().catch(() => {}); // Close reader immediately
+    reader.cancel().catch(() => {});
 
     if (!value) return false;
 
     const chunk = new TextDecoder().decode(value);
-
-    // Extract JSON payload from "data: {...}"
     const match = chunk.match(/data:\s*(\{.*\})/);
     if (match && match[1]) {
       const data = JSON.parse(match[1]);
@@ -142,7 +175,6 @@ async function checkStreamStatus(streamKey: string): Promise<boolean> {
   } catch {
     return false;
   } finally {
-    // Always clean up the WHEP session
     if (location) {
       const deleteUrl = location.startsWith('http') ? location : `${BASE_URL}${location}`;
       fetch(deleteUrl, {
@@ -154,75 +186,109 @@ async function checkStreamStatus(streamKey: string): Promise<boolean> {
 }
 
 /**
- * Polling loop for all stream keys
+ * Creates the single dashboard embed representing all monitored streams
  */
-async function pollStreams(channel: TextChannel) {
-  for (const stream of STREAMS) {
-    const key = stream.bearerToken;
-    const state = streamTracker.get(key);
-    if (!state) continue;
+function buildDashboardEmbed(): EmbedBuilder {
+  const anyLive = Array.from(streamTracker.values()).some((s) => s.isLive);
 
-    const isLive = await checkStreamStatus(key);
+  const streamLines = STREAMS.map((stream) => {
+    const state = streamTracker.get(stream.bearerToken);
+    const isLive = state?.isLive ?? false;
+    const watchUrl = `${BASE_URL}/${encodeURIComponent(stream.bearerToken)}`;
 
     if (isLive) {
-      state.consecutiveMisses = 0;
+      return `🟢 [**${stream.username}**](${watchUrl}) - \`${stream.bearerToken}\``;
+    }
+    return `⚫ **${stream.username}** - \`${stream.bearerToken}\``;
+  }).join('\n');
 
-      if (!state.isLive) {
+  return new EmbedBuilder()
+    .setTitle('📺 Broadcast Box')
+    .setURL(BASE_URL)
+    .setDescription(streamLines || 'No streams configured.')
+    .setColor(anyLive ? '#0ddb29' : '#2b2b2b')
+    .setTimestamp();
+}
+
+/**
+ * Polls status for all streams and updates the dashboard message
+ */
+async function pollStreams(channel: TextChannel) {
+  await Promise.all(
+    STREAMS.map(async (stream) => {
+      const key = stream.bearerToken;
+      const state = streamTracker.get(key);
+      if (!state) return;
+
+      const isLive = await checkStreamStatus(key);
+
+      if (isLive) {
+        state.consecutiveMisses = 0;
         state.isLive = true;
-        const watchUrl = `${BASE_URL}/${encodeURIComponent(key)}`;
-        const username = stream.username;
-
-        const embed = new EmbedBuilder()
-          .setTitle(`🟢 ${username} is now LIVE!`)
-          .setURL(watchUrl)
-          .setDescription(`Watch the stream directly on Broadcast Box: [Click here to Watch](${watchUrl})`)
-          .setColor('#0ddb29')
-          .addFields(
-            { name: 'Streamer', value: username, inline: true },
-            { name: 'Stream Key', value: `\`${key}\``, inline: true },
-            { name: 'Platform', value: 'Broadcast Box', inline: true }
-          )
-          .setTimestamp();
-
-        try {
-          const sentMessage = await channel.send({ embeds: [embed] });
-          state.messageId = sentMessage.id;
-          console.log(`[LIVE] ${username} (${key}) is live. Alert posted (Message ID: ${sentMessage.id})`);
-        } catch (err) {
-          console.error(`Failed to send alert for ${username} (${key}):`, err);
-        }
-      }
-    } else {
-      if (state.isLive) {
+      } else if (state.isLive) {
         state.consecutiveMisses++;
-
-        // Debounce: requires 2 consecutive offline checks (~30s) before deleting alert
         if (state.consecutiveMisses >= 2) {
           state.isLive = false;
-          console.log(`[OFFLINE] ${stream.username} (${key}) has ended.`);
-
-          if (state.messageId) {
-            try {
-              const msg = await channel.messages.fetch(state.messageId);
-              if (msg) {
-                await msg.delete();
-                console.log(`[CLEANUP] Deleted live alert message for ${stream.username}`);
-              }
-            } catch (err) {
-              console.warn(`Could not delete message for ${stream.username} (might already be deleted):`, err);
-            } finally {
-              state.messageId = null;
-            }
-          }
           state.consecutiveMisses = 0;
         }
       }
+    })
+  );
+
+  const embed = buildDashboardEmbed();
+
+  try {
+    if (dashboardMessage) {
+      await dashboardMessage.edit({ embeds: [embed] });
+    } else {
+      dashboardMessage = await channel.send({ embeds: [embed] });
+      await saveData({ messageId: dashboardMessage.id, streams: STREAMS });
+    }
+  } catch (err) {
+    console.warn('Could not edit dashboard message, recreating next cycle...', err);
+    dashboardMessage = null;
+  }
+}
+
+/**
+ * Resolves the message to track on startup
+ */
+async function resolveDashboardMessage(channel: TextChannel, savedMessageId: string | null): Promise<Message> {
+  // 1. Try fetching saved ID from JSON
+  if (savedMessageId) {
+    try {
+      const msg = await channel.messages.fetch(savedMessageId);
+      if (msg) return msg;
+    } catch {
+      console.warn(`Stored message ID (${savedMessageId}) not found in channel.`);
     }
   }
+
+  // 2. Fallback: check if the latest channel message was sent by this bot
+  try {
+    const recentMessages = await channel.messages.fetch({ limit: 1 });
+    const lastMessage = recentMessages.first();
+    if (lastMessage && lastMessage.author.id === client.user?.id) {
+      console.log(`Reusing last channel message (${lastMessage.id}) as dashboard.`);
+      return lastMessage;
+    }
+  } catch (err) {
+    console.warn('Failed to fetch recent channel messages:', err);
+  }
+
+  // 3. Fallback: send a brand new message
+  console.log('No reusable dashboard message found. Sending a new one.');
+  const initialEmbed = buildDashboardEmbed();
+  return await channel.send({ embeds: [initialEmbed] });
 }
 
 client.once(Events.ClientReady, async () => {
   console.log(`🤖 Logged in as ${client.user?.tag}!`);
+
+  const savedData = await loadData();
+  STREAMS = savedData.streams;
+  STREAMS.forEach((s) => initStreamState(s.bearerToken));
+
   console.log(`👀 Monitoring streamers: ${STREAMS.map((s) => `${s.username} (${s.bearerToken})`).join(', ')}`);
 
   try {
@@ -234,23 +300,96 @@ client.once(Events.ClientReady, async () => {
 
     console.log(`📡 Connected to target channel: #${channel.name}`);
 
-    // Send startup notification to Discord showing configured streamers
-    const onlineEmbed = new EmbedBuilder()
-      .setTitle('🟢 Stream Monitor Online')
-      .setDescription(
-        `Bot is now monitoring **${STREAMS.length}** streamer(s):\n` +
-          STREAMS.map((s) => `• **${s.username}** (\`${s.bearerToken}\`)`).join('\n')
-      )
-      .setColor('#57F287')
-      .setTimestamp();
+    // Resolve dashboard message
+    dashboardMessage = await resolveDashboardMessage(channel, savedData.messageId);
+    await saveData({ messageId: dashboardMessage.id, streams: STREAMS });
 
-    await channel.send({ embeds: [onlineEmbed] });
-
-    // Initial check and start polling loop
+    // Initial check & interval
     await pollStreams(channel);
     setInterval(() => pollStreams(channel), POLL_INTERVAL_MS);
   } catch (err) {
     console.error('Error on startup:', err);
+  }
+});
+
+/**
+ * Message command listener
+ */
+client.on(Events.MessageCreate, async (message) => {
+  if (message.author.bot) return;
+
+  const content = message.content.trim();
+  const channel = message.channel as TextChannel;
+
+  // Command: !new-message
+  if (content === '!new-message') {
+    try {
+      const embed = buildDashboardEmbed();
+      dashboardMessage = await channel.send({ embeds: [embed] });
+      await saveData({ messageId: dashboardMessage.id, streams: STREAMS });
+      await message.react("✅");
+      await pollStreams(channel);
+    } catch (err) {
+      console.error('Error creating new message:', err);
+    }
+    return;
+  }
+
+  // Command: !add-stream <name> <bearer_token>
+  if (content.startsWith('!add-stream')) {
+    const parts = content.split(/\s+/);
+    if (parts.length < 3) {
+      await message.reply('❌ Usage: `!add-stream <username> <bearerToken>`');
+      return;
+    }
+
+    const username = parts[1];
+    const bearerToken = parts[2];
+
+    const existing = STREAMS.find((s) => s.bearerToken === bearerToken);
+    if (existing) {
+      await message.reply(`❌ Stream with token \`${bearerToken}\` already exists (${existing.username}).`);
+      return;
+    }
+
+    STREAMS.push({ username, bearerToken });
+    initStreamState(bearerToken);
+    await saveData({ messageId: dashboardMessage?.id ?? null, streams: STREAMS });
+
+    await message.reply(`✅ Added stream for **${username}**.`);
+    if (channel.id === CHANNEL_ID) {
+      await pollStreams(channel);
+    }
+    return;
+  }
+
+  // Command: !remove-stream <username | bearer_token>
+  if (content.startsWith('!remove-stream')) {
+    const parts = content.split(/\s+/);
+    if (parts.length < 2) {
+      await message.reply('❌ Usage: `!remove-stream <username|bearerToken>`');
+      return;
+    }
+
+    const target = parts[1];
+    const index = STREAMS.findIndex(
+      (s) => s.bearerToken === target || s.username.toLowerCase() === target.toLowerCase()
+    );
+
+    if (index === -1) {
+      await message.reply(`❌ No stream found matching \`${target}\`.`);
+      return;
+    }
+
+    const [removed] = STREAMS.splice(index, 1);
+    streamTracker.delete(removed.bearerToken);
+    await saveData({ messageId: dashboardMessage?.id ?? null, streams: STREAMS });
+
+    await message.reply(`✅ Removed stream **${removed.username}**.`);
+    if (channel.id === CHANNEL_ID) {
+      await pollStreams(channel);
+    }
+    return;
   }
 });
 
