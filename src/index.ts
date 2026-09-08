@@ -14,6 +14,7 @@ dotenv.config();
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const CHANNEL_ID = process.env.CHANNEL_ID || '532676295939850250';
+const PREFIX = '!';
 const DATA_FILE = path.join(__dirname, 'data.json');
 
 const DEFAULT_STREAMS = [
@@ -80,7 +81,15 @@ interface StorageData {
   streams: Array<{ username: string; bearerToken: string }>;
 }
 
+interface Command {
+  name: string;
+  description: string;
+  usage: string;
+  execute: (message: Message, args: string[]) => Promise<void>;
+}
+
 const streamTracker = new Map<string, StreamState>();
+const commands = new Map<string, Command>();
 let dashboardMessage: Message | null = null;
 
 const client = new Client({
@@ -254,7 +263,6 @@ async function pollStreams(channel: TextChannel) {
  * Resolves the message to track on startup
  */
 async function resolveDashboardMessage(channel: TextChannel, savedMessageId: string | null): Promise<Message> {
-  // 1. Try fetching saved ID from JSON
   if (savedMessageId) {
     try {
       const msg = await channel.messages.fetch(savedMessageId);
@@ -264,7 +272,6 @@ async function resolveDashboardMessage(channel: TextChannel, savedMessageId: str
     }
   }
 
-  // 2. Fallback: check if the latest channel message was sent by this bot
   try {
     const recentMessages = await channel.messages.fetch({ limit: 1 });
     const lastMessage = recentMessages.first();
@@ -276,11 +283,109 @@ async function resolveDashboardMessage(channel: TextChannel, savedMessageId: str
     console.warn('Failed to fetch recent channel messages:', err);
   }
 
-  // 3. Fallback: send a brand new message
   console.log('No reusable dashboard message found. Sending a new one.');
   const initialEmbed = buildDashboardEmbed();
   return await channel.send({ embeds: [initialEmbed] });
 }
+
+/**
+ * Command Registration
+ */
+function registerCommand(cmd: Command) {
+  commands.set(cmd.name.toLowerCase(), cmd);
+}
+
+registerCommand({
+  name: 'help',
+  description: 'Shows this list of available commands.',
+  usage: `${PREFIX}help`,
+  execute: async (message) => {
+    const embed = new EmbedBuilder()
+      .setTitle('📖 Broadcast Box Commands')
+      .setColor('#0099ff')
+      .setDescription(
+        Array.from(commands.values())
+          .map((c) => `**\`${c.usage}\`**\n${c.description}`)
+          .join('\n\n')
+      )
+      .setTimestamp();
+
+    await message.reply({ embeds: [embed] });
+  },
+});
+
+registerCommand({
+  name: 'new-message',
+  description: 'Spawns a new live dashboard message in this channel.',
+  usage: `${PREFIX}new-message`,
+  execute: async (message) => {
+    const channel = message.channel as TextChannel;
+    const embed = buildDashboardEmbed();
+    dashboardMessage = await channel.send({ embeds: [embed] });
+    await saveData({ messageId: dashboardMessage.id, streams: STREAMS });
+    await message.react('✅');
+    await pollStreams(channel);
+  },
+});
+
+registerCommand({
+  name: 'add-stream',
+  description: 'Adds a new stream to monitor.',
+  usage: `${PREFIX}add-stream <username> <bearerToken>`,
+  execute: async (message, args) => {
+    if (args.length < 2) {
+      await message.reply(`❌ Usage: \`${PREFIX}add-stream <username> <bearerToken>\``);
+      return;
+    }
+
+    const [username, bearerToken] = args;
+    const existing = STREAMS.find((s) => s.bearerToken === bearerToken);
+    if (existing) {
+      await message.reply(`❌ Stream with token \`${bearerToken}\` already exists (${existing.username}).`);
+      return;
+    }
+
+    STREAMS.push({ username, bearerToken });
+    initStreamState(bearerToken);
+    await saveData({ messageId: dashboardMessage?.id ?? null, streams: STREAMS });
+
+    await message.reply(`✅ Added stream for **${username}**.`);
+    if (message.channel.id === CHANNEL_ID) {
+      await pollStreams(message.channel as TextChannel);
+    }
+  },
+});
+
+registerCommand({
+  name: 'remove-stream',
+  description: 'Removes a stream by username or token.',
+  usage: `${PREFIX}remove-stream <username|bearerToken>`,
+  execute: async (message, args) => {
+    if (args.length < 1) {
+      await message.reply(`❌ Usage: \`${PREFIX}remove-stream <username|bearerToken>\``);
+      return;
+    }
+
+    const target = args[0];
+    const index = STREAMS.findIndex(
+      (s) => s.bearerToken === target || s.username.toLowerCase() === target.toLowerCase()
+    );
+
+    if (index === -1) {
+      await message.reply(`❌ No stream found matching \`${target}\`.`);
+      return;
+    }
+
+    const [removed] = STREAMS.splice(index, 1);
+    streamTracker.delete(removed.bearerToken);
+    await saveData({ messageId: dashboardMessage?.id ?? null, streams: STREAMS });
+
+    await message.reply(`✅ Removed stream **${removed.username}**.`);
+    if (message.channel.id === CHANNEL_ID) {
+      await pollStreams(message.channel as TextChannel);
+    }
+  },
+});
 
 client.once(Events.ClientReady, async () => {
   console.log(`🤖 Logged in as ${client.user?.tag}!`);
@@ -300,11 +405,9 @@ client.once(Events.ClientReady, async () => {
 
     console.log(`📡 Connected to target channel: #${channel.name}`);
 
-    // Resolve dashboard message
     dashboardMessage = await resolveDashboardMessage(channel, savedData.messageId);
     await saveData({ messageId: dashboardMessage.id, streams: STREAMS });
 
-    // Initial check & interval
     await pollStreams(channel);
     setInterval(() => pollStreams(channel), POLL_INTERVAL_MS);
   } catch (err) {
@@ -313,83 +416,24 @@ client.once(Events.ClientReady, async () => {
 });
 
 /**
- * Message command listener
+ * Message command dispatcher
  */
 client.on(Events.MessageCreate, async (message) => {
-  if (message.author.bot) return;
+  if (message.author.bot || !message.content.startsWith(PREFIX)) return;
 
-  const content = message.content.trim();
-  const channel = message.channel as TextChannel;
+  const args = message.content.slice(PREFIX.length).trim().split(/\s+/);
+  const commandName = args.shift()?.toLowerCase();
 
-  // Command: !new-message
-  if (content === '!new-message') {
-    try {
-      const embed = buildDashboardEmbed();
-      dashboardMessage = await channel.send({ embeds: [embed] });
-      await saveData({ messageId: dashboardMessage.id, streams: STREAMS });
-      await message.react("✅");
-      await pollStreams(channel);
-    } catch (err) {
-      console.error('Error creating new message:', err);
-    }
-    return;
-  }
+  if (!commandName) return;
 
-  // Command: !add-stream <name> <bearer_token>
-  if (content.startsWith('!add-stream')) {
-    const parts = content.split(/\s+/);
-    if (parts.length < 3) {
-      await message.reply('❌ Usage: `!add-stream <username> <bearerToken>`');
-      return;
-    }
+  const command = commands.get(commandName);
+  if (!command) return;
 
-    const username = parts[1];
-    const bearerToken = parts[2];
-
-    const existing = STREAMS.find((s) => s.bearerToken === bearerToken);
-    if (existing) {
-      await message.reply(`❌ Stream with token \`${bearerToken}\` already exists (${existing.username}).`);
-      return;
-    }
-
-    STREAMS.push({ username, bearerToken });
-    initStreamState(bearerToken);
-    await saveData({ messageId: dashboardMessage?.id ?? null, streams: STREAMS });
-
-    await message.reply(`✅ Added stream for **${username}**.`);
-    if (channel.id === CHANNEL_ID) {
-      await pollStreams(channel);
-    }
-    return;
-  }
-
-  // Command: !remove-stream <username | bearer_token>
-  if (content.startsWith('!remove-stream')) {
-    const parts = content.split(/\s+/);
-    if (parts.length < 2) {
-      await message.reply('❌ Usage: `!remove-stream <username|bearerToken>`');
-      return;
-    }
-
-    const target = parts[1];
-    const index = STREAMS.findIndex(
-      (s) => s.bearerToken === target || s.username.toLowerCase() === target.toLowerCase()
-    );
-
-    if (index === -1) {
-      await message.reply(`❌ No stream found matching \`${target}\`.`);
-      return;
-    }
-
-    const [removed] = STREAMS.splice(index, 1);
-    streamTracker.delete(removed.bearerToken);
-    await saveData({ messageId: dashboardMessage?.id ?? null, streams: STREAMS });
-
-    await message.reply(`✅ Removed stream **${removed.username}**.`);
-    if (channel.id === CHANNEL_ID) {
-      await pollStreams(channel);
-    }
-    return;
+  try {
+    await command.execute(message, args);
+  } catch (err) {
+    console.error(`Error executing command !${commandName}:`, err);
+    await message.reply('❌ An error occurred while executing this command.');
   }
 });
 
