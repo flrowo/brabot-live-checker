@@ -13,6 +13,7 @@ import path from 'path';
 dotenv.config();
 
 const TOKEN = process.env.DISCORD_TOKEN;
+const FERIADOS_API_KEY = process.env.FERIADOS_API_KEY;
 const CHANNEL_ID = process.env.CHANNEL_ID || '532676295939850250';
 const PREFIX = '!';
 const DATA_FILE = path.join(__dirname, 'data.json');
@@ -383,6 +384,111 @@ registerCommand({
     await message.reply(`✅ Removed stream **${removed.username}**.`);
     if (message.channel.id === CHANNEL_ID) {
       await pollStreams(message.channel as TextChannel);
+    }
+  },
+});
+
+interface ApiHoliday {
+  data: string;
+  nome: string;
+  tipo: string;
+  descricao?: string;
+  bancario?: boolean;
+}
+
+function toIsoDate(ddmmyyyy: string): string {
+  const [day, month, year] = ddmmyyyy.split('/');
+  return `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
+}
+
+function formatHolidayDate(dateStr: string): string {
+  const [d, m, y] = dateStr.split('/').map(Number);
+  const date = new Date(y, m - 1, d);
+  const weekday = date.toLocaleDateString('pt-BR', { weekday: 'long' });
+  return `${dateStr} (${weekday.charAt(0).toUpperCase() + weekday.slice(1)})`;
+}
+
+async function fetchCityHolidays(year: number): Promise<ApiHoliday[]> {
+  const res = await fetch(`https://feriadosapi.com/api/v1/feriados/cidade/3550308?ano=${year}&facultativos=true`, {
+    headers: { Authorization: `Bearer ${FERIADOS_API_KEY}`, 'X-API-Key': FERIADOS_API_KEY || '' },
+  });
+  if (!res.ok) throw new Error(`API returned HTTP ${res.status}`);
+  const data = await res.json();
+  return data.feriados || [];
+}
+
+function deduplicateAndFilterFuture(holidays: ApiHoliday[], todayIso: string): ApiHoliday[] {
+  const deduped = new Map<string, ApiHoliday>();
+  for (const h of holidays) {
+    if (toIsoDate(h.data) <= todayIso) continue;
+    const existing = deduped.get(h.data);
+    if (!existing || (existing.tipo === 'FACULTATIVO' && h.tipo !== 'FACULTATIVO')) {
+      deduped.set(h.data, h);
+    }
+  }
+  return Array.from(deduped.values()).sort((a, b) => toIsoDate(a.data).localeCompare(toIsoDate(b.data)));
+}
+
+registerCommand({
+  name: 'feriado',
+  description: 'Mostra o próximo feriado em São Paulo (capital).',
+  usage: `${PREFIX}feriado`,
+  execute: async (message) => {
+    if (!FERIADOS_API_KEY) {
+      await message.reply('❌ `FERIADOS_API_KEY` não está configurada no `.env`.');
+      return;
+    }
+
+    try {
+      const parts = new Intl.DateTimeFormat('en-US', {
+        timeZone: 'America/Sao_Paulo',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+      }).formatToParts(new Date());
+
+      const year = parseInt(parts.find((p) => p.type === 'year')!.value, 10);
+      const month = parts.find((p) => p.type === 'month')!.value;
+      const day = parts.find((p) => p.type === 'day')!.value;
+      const todayIso = `${year}-${month}-${day}`;
+
+      let upcoming = deduplicateAndFilterFuture(await fetchCityHolidays(year), todayIso);
+
+      const needsNextYear =
+        upcoming.length === 0 || (upcoming[0].tipo === 'FACULTATIVO' && !upcoming.some((h) => h.tipo !== 'FACULTATIVO'));
+
+      if (needsNextYear) {
+        upcoming = [...upcoming, ...deduplicateAndFilterFuture(await fetchCityHolidays(year + 1), todayIso)];
+      }
+
+      if (upcoming.length === 0) {
+        await message.reply('Nenhum próximo feriado encontrado.');
+        return;
+      }
+
+      const selected: ApiHoliday[] = [upcoming[0]];
+      if (upcoming[0].tipo === 'FACULTATIVO') {
+        const nextOfficial = upcoming.find((h, idx) => idx > 0 && h.tipo !== 'FACULTATIVO');
+        if (nextOfficial) selected.push(nextOfficial);
+      }
+
+      const embed = new EmbedBuilder()
+        .setTitle(selected.length > 1 ? '🗓️ Próximos Feriados' : '🗓️ Próximo Feriado')
+        .setColor('#0099ff')
+        .setTimestamp();
+
+      for (const h of selected) {
+        const title = `${h.nome} - ${formatHolidayDate(h.data)}`;
+        const details = [`**Tipo:** ${h.tipo}`, h.bancario ? '🏦 *Feriado Bancário*' : null, h.descricao || null]
+          .filter(Boolean)
+          .join('\n');
+        embed.addFields({ name: title, value: details });
+      }
+
+      await message.reply({ embeds: [embed] });
+    } catch (err) {
+      console.error('Failed to fetch holiday data:', err);
+      await message.reply('❌ Ocorreu um erro ao consultar os feriados.');
     }
   },
 });
