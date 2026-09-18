@@ -17,29 +17,27 @@ const FERIADOS_API_KEY = process.env.FERIADOS_API_KEY;
 const CHANNEL_ID = process.env.CHANNEL_ID || '532676295939850250';
 const PREFIX = '!';
 const DATA_FILE = path.join(__dirname, 'data.json');
+const BASE_URL = 'https://b.siobud.com';
 
 const DEFAULT_STREAMS = [
-  { username: "Bruno", bearerToken: "FSIauhwiuasdhiufhiusah913274y1273" },
-  { username: "Jão", bearerToken: "eae" },
-  { username: "Andre", bearerToken: "asdasdasdasdasdasdasdasdas" },
-  { username: "Fernandes", bearerToken: "IPC" },
-  { username: "Soave", bearerToken: "SODFGNDFGJUNDSFGJSDN43814871" },
-  { username: "Fab", bearerToken: "sddse6cyrene" },
-  { username: "Vitor", bearerToken: "Teste" },
-  { username: "Thiago", bearerToken: "billibilli" },
+  { username: 'Bruno', bearerToken: 'FSIauhwiuasdhiufhiusah913274y1273' },
+  { username: 'Jão', bearerToken: 'eae' },
+  { username: 'Andre', bearerToken: 'asdasdasdasdasdasdasdasdas' },
+  { username: 'Fernandes', bearerToken: 'IPC' },
+  { username: 'Soave', bearerToken: 'SODFGNDFGJUNDSFGJSDN43814871' },
+  { username: 'Fab', bearerToken: 'sddse6cyrene' },
+  { username: 'Vitor', bearerToken: 'Teste' },
+  { username: 'Thiago', bearerToken: 'billibilli' },
 ];
 
 let STREAMS: Array<{ username: string; bearerToken: string }> = [];
-
-const POLL_INTERVAL_MS = 60_000;
-const BASE_URL = 'https://b.siobud.com';
 
 if (!TOKEN) {
   console.error('❌ Error: DISCORD_TOKEN is missing in .env');
   process.exit(1);
 }
 
-// Minimal standard WebRTC SDP Offer to probe WHEP playback
+// Minimal standard WebRTC SDP Offer to initiate WHEP playback
 const PROBE_SDP = [
   'v=0',
   'o=- 1234567890 2 IN IP4 127.0.0.1',
@@ -74,7 +72,6 @@ const PROBE_SDP = [
 
 interface StreamState {
   isLive: boolean;
-  consecutiveMisses: number;
 }
 
 interface StorageData {
@@ -89,9 +86,18 @@ interface Command {
   execute: (message: Message, args: string[]) => Promise<void>;
 }
 
+interface ActiveStreamSession {
+  abortController: AbortController;
+  currentLocation: string | null;
+}
+
 const streamTracker = new Map<string, StreamState>();
+const activeSessions = new Map<string, ActiveStreamSession>();
 const commands = new Map<string, Command>();
+
 let dashboardMessage: Message | null = null;
+let activeChannel: TextChannel | null = null;
+let updateDebounceTimeout: NodeJS.Timeout | null = null;
 
 const client = new Client({
   intents: [
@@ -128,70 +134,7 @@ async function saveData(data: StorageData): Promise<void> {
 
 function initStreamState(token: string) {
   if (!streamTracker.has(token)) {
-    streamTracker.set(token, {
-      isLive: false,
-      consecutiveMisses: 0,
-    });
-  }
-}
-
-/**
- * Checks if a stream is live via SSE
- */
-async function checkStreamStatus(streamKey: string): Promise<boolean> {
-  let location: string | null = null;
-
-  try {
-    const res = await fetch(`${BASE_URL}/api/whep`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${streamKey}`,
-        'Content-Type': 'application/sdp',
-      },
-      body: PROBE_SDP,
-      signal: AbortSignal.timeout(5000),
-    });
-
-    if (res.status !== 201 && res.status !== 200) {
-      return false;
-    }
-
-    location = res.headers.get('Location');
-    if (!location) return false;
-
-    const sseUrl = `${BASE_URL}${location.replace('/api/whep/', '/api/sse/')}`;
-    const sseRes = await fetch(sseUrl, {
-      signal: AbortSignal.timeout(3000),
-    });
-
-    if (!sseRes.ok || !sseRes.body) {
-      return false;
-    }
-
-    const reader = sseRes.body.getReader();
-    const { value } = await reader.read();
-    reader.cancel().catch(() => {});
-
-    if (!value) return false;
-
-    const chunk = new TextDecoder().decode(value);
-    const match = chunk.match(/data:\s*(\{.*\})/);
-    if (match && match[1]) {
-      const data = JSON.parse(match[1]);
-      return Boolean(data.isOnline);
-    }
-
-    return false;
-  } catch {
-    return false;
-  } finally {
-    if (location) {
-      const deleteUrl = location.startsWith('http') ? location : `${BASE_URL}${location}`;
-      fetch(deleteUrl, {
-        method: 'DELETE',
-        headers: { Authorization: `Bearer ${streamKey}` },
-      }).catch(() => {});
-    }
+    streamTracker.set(token, { isLive: false });
   }
 }
 
@@ -221,32 +164,10 @@ function buildDashboardEmbed(): EmbedBuilder {
 }
 
 /**
- * Polls status for all streams and updates the dashboard message
+ * Updates the Discord dashboard message
  */
-async function pollStreams(channel: TextChannel) {
-  await Promise.all(
-    STREAMS.map(async (stream) => {
-      const key = stream.bearerToken;
-      const state = streamTracker.get(key);
-      if (!state) return;
-
-      const isLive = await checkStreamStatus(key);
-
-      if (isLive) {
-        state.consecutiveMisses = 0;
-        state.isLive = true;
-      } else if (state.isLive) {
-        state.consecutiveMisses++;
-        if (state.consecutiveMisses >= 2) {
-          state.isLive = false;
-          state.consecutiveMisses = 0;
-        }
-      }
-    })
-  );
-
+async function updateDashboard(channel: TextChannel) {
   const embed = buildDashboardEmbed();
-
   try {
     if (dashboardMessage) {
       await dashboardMessage.edit({ embeds: [embed] });
@@ -255,9 +176,167 @@ async function pollStreams(channel: TextChannel) {
       await saveData({ messageId: dashboardMessage.id, streams: STREAMS });
     }
   } catch (err) {
-    console.warn('Could not edit dashboard message, recreating next cycle...', err);
+    console.warn('Could not edit dashboard message, recreating on next update...', err);
     dashboardMessage = null;
   }
+}
+
+/**
+ * Debounced dashboard updater to protect against Discord API rate limits
+ */
+function triggerDashboardUpdate() {
+  if (updateDebounceTimeout) return;
+  updateDebounceTimeout = setTimeout(async () => {
+    updateDebounceTimeout = null;
+    if (activeChannel) {
+      await updateDashboard(activeChannel);
+    }
+  }, 1500);
+}
+
+function handleStatusChange(token: string, isLive: boolean) {
+  const state = streamTracker.get(token);
+  if (!state) return;
+
+  if (state.isLive !== isLive) {
+    state.isLive = isLive;
+    triggerDashboardUpdate();
+  }
+}
+
+/**
+ * Long-lived SSE worker for a single stream with automatic reconnect
+ */
+async function runStreamSseWorker(token: string, session: ActiveStreamSession) {
+  while (!session.abortController.signal.aborted) {
+    let location: string | null = null;
+    try {
+      const res = await fetch(`${BASE_URL}/api/whep`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/sdp',
+        },
+        body: PROBE_SDP,
+        signal: AbortSignal.any([session.abortController.signal, AbortSignal.timeout(10000)]),
+      });
+
+      if (!res.ok) {
+        handleStatusChange(token, false);
+        await new Promise((r) => setTimeout(r, 5000));
+        continue;
+      }
+
+      location = res.headers.get('Location');
+      session.currentLocation = location;
+      if (!location) {
+        handleStatusChange(token, false);
+        await new Promise((r) => setTimeout(r, 5000));
+        continue;
+      }
+
+      const ssePath = location.replace('/api/whep/', '/api/sse/');
+      const sseUrl = location.startsWith('http') ? ssePath : `${BASE_URL}${ssePath}`;
+
+      const sseRes = await fetch(sseUrl, {
+        signal: session.abortController.signal,
+      });
+
+      if (!sseRes.ok || !sseRes.body) {
+        handleStatusChange(token, false);
+        await new Promise((r) => setTimeout(r, 5000));
+        continue;
+      }
+
+      const reader = sseRes.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (!session.abortController.signal.aborted) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (trimmed.startsWith('data:')) {
+            const payload = trimmed.slice(5).trim();
+            try {
+              const data = JSON.parse(payload);
+              if (typeof data.isOnline === 'boolean') {
+                handleStatusChange(token, data.isOnline);
+              }
+            } catch {
+              // Ignore unparseable SSE lines
+            }
+          }
+        }
+      }
+    } catch {
+      handleStatusChange(token, false);
+    } finally {
+      if (location) {
+        const deleteUrl = location.startsWith('http') ? location : `${BASE_URL}${location}`;
+        fetch(deleteUrl, {
+          method: 'DELETE',
+          headers: { Authorization: `Bearer ${token}` },
+        }).catch(() => {});
+        session.currentLocation = null;
+      }
+    }
+
+    if (!session.abortController.signal.aborted) {
+      await new Promise((r) => setTimeout(r, 5000));
+    }
+  }
+}
+
+function startMonitoringStream(token: string) {
+  if (activeSessions.has(token)) return;
+
+  const session: ActiveStreamSession = {
+    abortController: new AbortController(),
+    currentLocation: null,
+  };
+  activeSessions.set(token, session);
+  runStreamSseWorker(token, session);
+}
+
+function stopMonitoringStream(token: string) {
+  const session = activeSessions.get(token);
+  if (!session) return;
+
+  session.abortController.abort();
+  if (session.currentLocation) {
+    const deleteUrl = session.currentLocation.startsWith('http')
+      ? session.currentLocation
+      : `${BASE_URL}${session.currentLocation}`;
+    fetch(deleteUrl, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${token}` },
+    }).catch(() => {});
+  }
+  activeSessions.delete(token);
+  streamTracker.delete(token);
+}
+
+function cleanupAllSessions() {
+  for (const [token, session] of activeSessions.entries()) {
+    session.abortController.abort();
+    if (session.currentLocation) {
+      const deleteUrl = session.currentLocation.startsWith('http')
+        ? session.currentLocation
+        : `${BASE_URL}${session.currentLocation}`;
+      fetch(deleteUrl, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
+      }).catch(() => {});
+    }
+  }
+  activeSessions.clear();
 }
 
 /**
@@ -290,104 +369,8 @@ async function resolveDashboardMessage(channel: TextChannel, savedMessageId: str
 }
 
 /**
- * Command Registration
+ * Holiday Helpers
  */
-function registerCommand(cmd: Command) {
-  commands.set(cmd.name.toLowerCase(), cmd);
-}
-
-registerCommand({
-  name: 'help',
-  description: 'Shows this list of available commands.',
-  usage: `${PREFIX}help`,
-  execute: async (message) => {
-    const embed = new EmbedBuilder()
-      .setTitle('📖 Broadcast Box Commands')
-      .setColor('#0099ff')
-      .setDescription(
-        Array.from(commands.values())
-          .map((c) => `**\`${c.usage}\`**\n${c.description}`)
-          .join('\n\n')
-      )
-      .setTimestamp();
-
-    await message.reply({ embeds: [embed] });
-  },
-});
-
-registerCommand({
-  name: 'new-message',
-  description: 'Spawns a new live dashboard message in this channel.',
-  usage: `${PREFIX}new-message`,
-  execute: async (message) => {
-    const channel = message.channel as TextChannel;
-    const embed = buildDashboardEmbed();
-    dashboardMessage = await channel.send({ embeds: [embed] });
-    await saveData({ messageId: dashboardMessage.id, streams: STREAMS });
-    await message.react('✅');
-    await pollStreams(channel);
-  },
-});
-
-registerCommand({
-  name: 'add-stream',
-  description: 'Adds a new stream to monitor.',
-  usage: `${PREFIX}add-stream <username> <bearerToken>`,
-  execute: async (message, args) => {
-    if (args.length < 2) {
-      await message.reply(`❌ Usage: \`${PREFIX}add-stream <username> <bearerToken>\``);
-      return;
-    }
-
-    const [username, bearerToken] = args;
-    const existing = STREAMS.find((s) => s.bearerToken === bearerToken);
-    if (existing) {
-      await message.reply(`❌ Stream with token \`${bearerToken}\` already exists (${existing.username}).`);
-      return;
-    }
-
-    STREAMS.push({ username, bearerToken });
-    initStreamState(bearerToken);
-    await saveData({ messageId: dashboardMessage?.id ?? null, streams: STREAMS });
-
-    await message.reply(`✅ Added stream for **${username}**.`);
-    if (message.channel.id === CHANNEL_ID) {
-      await pollStreams(message.channel as TextChannel);
-    }
-  },
-});
-
-registerCommand({
-  name: 'remove-stream',
-  description: 'Removes a stream by username or token.',
-  usage: `${PREFIX}remove-stream <username|bearerToken>`,
-  execute: async (message, args) => {
-    if (args.length < 1) {
-      await message.reply(`❌ Usage: \`${PREFIX}remove-stream <username|bearerToken>\``);
-      return;
-    }
-
-    const target = args[0];
-    const index = STREAMS.findIndex(
-      (s) => s.bearerToken === target || s.username.toLowerCase() === target.toLowerCase()
-    );
-
-    if (index === -1) {
-      await message.reply(`❌ No stream found matching \`${target}\`.`);
-      return;
-    }
-
-    const [removed] = STREAMS.splice(index, 1);
-    streamTracker.delete(removed.bearerToken);
-    await saveData({ messageId: dashboardMessage?.id ?? null, streams: STREAMS });
-
-    await message.reply(`✅ Removed stream **${removed.username}**.`);
-    if (message.channel.id === CHANNEL_ID) {
-      await pollStreams(message.channel as TextChannel);
-    }
-  },
-});
-
 interface ApiHoliday {
   data: string;
   nome: string;
@@ -429,10 +412,102 @@ function deduplicateAndFilterFuture(holidays: ApiHoliday[], todayIso: string): A
   return Array.from(deduped.values()).sort((a, b) => toIsoDate(a.data).localeCompare(toIsoDate(b.data)));
 }
 
-registerCommand({
-  name: 'feriado',
+/* Commands */
+commands.set('help', {
+  name: 'help',
+  description: 'Shows this list of available commands.',
+  usage: `${PREFIX}help`,
+  execute: async (message) => {
+    const uniqueCommands = Array.from(new Set(commands.values()));
+    const embed = new EmbedBuilder()
+      .setTitle('📖 Broadcast Box Commands')
+      .setColor('#0099ff')
+      .setDescription(uniqueCommands.map((c) => `**\`${c.usage}\`**\n${c.description}`).join('\n\n'))
+      .setTimestamp();
+
+    await message.reply({ embeds: [embed] });
+  },
+});
+
+commands.set('new-message', {
+  name: 'new-message',
+  description: 'Spawns a new live dashboard message in this channel.',
+  usage: `${PREFIX}new-message`,
+  execute: async (message) => {
+    const channel = message.channel as TextChannel;
+    activeChannel = channel;
+    const embed = buildDashboardEmbed();
+    dashboardMessage = await channel.send({ embeds: [embed] });
+    await saveData({ messageId: dashboardMessage.id, streams: STREAMS });
+    await message.react('✅');
+    await updateDashboard(channel);
+  },
+});
+
+commands.set('add-stream', {
+  name: 'add-stream',
+  description: 'Adds a new stream to monitor.',
+  usage: `${PREFIX}add-stream <username> <bearerToken>`,
+  execute: async (message, args) => {
+    if (args.length < 2) {
+      await message.reply(`❌ Usage: \`${PREFIX}add-stream <username> <bearerToken>\``);
+      return;
+    }
+
+    const [username, bearerToken] = args;
+    const existing = STREAMS.find((s) => s.bearerToken === bearerToken);
+    if (existing) {
+      await message.reply(`❌ Stream with token \`${bearerToken}\` already exists (${existing.username}).`);
+      return;
+    }
+
+    STREAMS.push({ username, bearerToken });
+    initStreamState(bearerToken);
+    startMonitoringStream(bearerToken);
+    await saveData({ messageId: dashboardMessage?.id ?? null, streams: STREAMS });
+
+    await message.reply(`✅ Added stream for **${username}**.`);
+    if (activeChannel) {
+      await updateDashboard(activeChannel);
+    }
+  },
+});
+
+commands.set('remove-stream', {
+  name: 'remove-stream',
+  description: 'Removes a stream by username or token.',
+  usage: `${PREFIX}remove-stream <username|bearerToken>`,
+  execute: async (message, args) => {
+    if (args.length < 1) {
+      await message.reply(`❌ Usage: \`${PREFIX}remove-stream <username|bearerToken>\``);
+      return;
+    }
+
+    const target = args[0];
+    const index = STREAMS.findIndex(
+      (s) => s.bearerToken === target || s.username.toLowerCase() === target.toLowerCase()
+    );
+
+    if (index === -1) {
+      await message.reply(`❌ No stream found matching \`${target}\`.`);
+      return;
+    }
+
+    const [removed] = STREAMS.splice(index, 1);
+    stopMonitoringStream(removed.bearerToken);
+    await saveData({ messageId: dashboardMessage?.id ?? null, streams: STREAMS });
+
+    await message.reply(`✅ Removed stream **${removed.username}**.`);
+    if (activeChannel) {
+      await updateDashboard(activeChannel);
+    }
+  },
+});
+
+const holidayCommand: Command = {
+  name: 'holiday',
   description: 'Mostra o próximo feriado em São Paulo (capital).',
-  usage: `${PREFIX}feriado`,
+  usage: `${PREFIX}holiday | ${PREFIX}next-holiday`,
   execute: async (message) => {
     if (!FERIADOS_API_KEY) {
       await message.reply('❌ `FERIADOS_API_KEY` não está configurada no `.env`.');
@@ -491,8 +566,14 @@ registerCommand({
       await message.reply('❌ Ocorreu um erro ao consultar os feriados.');
     }
   },
-});
+};
 
+commands.set('holiday', holidayCommand);
+commands.set('next-holiday', holidayCommand);
+
+/**
+ * Startup
+ */
 client.once(Events.ClientReady, async () => {
   console.log(`🤖 Logged in as ${client.user?.tag}!`);
 
@@ -509,13 +590,15 @@ client.once(Events.ClientReady, async () => {
       process.exit(1);
     }
 
+    activeChannel = channel;
     console.log(`📡 Connected to target channel: #${channel.name}`);
 
     dashboardMessage = await resolveDashboardMessage(channel, savedData.messageId);
     await saveData({ messageId: dashboardMessage.id, streams: STREAMS });
 
-    await pollStreams(channel);
-    setInterval(() => pollStreams(channel), POLL_INTERVAL_MS);
+    // Start persistent SSE listeners for all registered streams
+    STREAMS.forEach((s) => startMonitoringStream(s.bearerToken));
+    await updateDashboard(channel);
   } catch (err) {
     console.error('Error on startup:', err);
   }
@@ -541,6 +624,16 @@ client.on(Events.MessageCreate, async (message) => {
     console.error(`Error executing command !${commandName}:`, err);
     await message.reply('❌ An error occurred while executing this command.');
   }
+});
+
+process.on('SIGINT', () => {
+  cleanupAllSessions();
+  process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+  cleanupAllSessions();
+  process.exit(0);
 });
 
 client.login(TOKEN);
