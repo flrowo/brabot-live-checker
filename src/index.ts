@@ -144,7 +144,13 @@ function initStreamState(token: string) {
 function buildDashboardEmbed(): EmbedBuilder {
   const anyLive = Array.from(streamTracker.values()).some((s) => s.isLive);
 
-  const streamLines = STREAMS.map((stream) => {
+  const sortedStreams = [...STREAMS].sort((a, b) => {
+    const aLive = streamTracker.get(a.bearerToken)?.isLive ?? false;
+    const bLive = streamTracker.get(b.bearerToken)?.isLive ?? false;
+    return Number(bLive) - Number(aLive);
+  });
+
+  const streamLines = sortedStreams.map((stream) => {
     const state = streamTracker.get(stream.bearerToken);
     const isLive = state?.isLive ?? false;
     const watchUrl = `${BASE_URL}/${encodeURIComponent(stream.bearerToken)}`;
